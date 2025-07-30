@@ -394,6 +394,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
             }
             # The sliding window alternating layers are not always activated depending on the config
             if self.has_sliding_layers:
+                # lets test if we can change this file
                 causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
 
         hidden_states = inputs_embeds
