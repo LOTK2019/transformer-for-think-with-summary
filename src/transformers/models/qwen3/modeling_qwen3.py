@@ -192,6 +192,12 @@ class Qwen3Attention(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
+        
+        if 'sliding_window' not in kwargs and self.config.use_sliding_window:
+            raise ValueError("sliding window miss")
+        
+        sliding_window = kwargs.get('sliding_window', None)
+
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
@@ -219,7 +225,7 @@ class Qwen3Attention(nn.Module):
             attention_mask,
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
-            sliding_window=self.sliding_window,  # diff with Llama
+            sliding_window=self.sliding_window if sliding_window == None else sliding_window,  # diff with Llama
             **kwargs,
         )
 
@@ -326,6 +332,51 @@ class Qwen3RotaryEmbedding(nn.Module):
 
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
+def calculate_sliding_window(input_ids: torch.LongTensor) -> int:
+    """
+    计算sliding window的长度
+    
+    规则：
+    - 如果存在 </summary> 标签（id=151670），则从最后一个 <summary> 标签（id=151669）开始到末尾
+    - 如果不存在 </summary> 标签，则为整个input_ids的长度
+    
+    Args:
+        input_ids: 输入的token ids张量
+    
+    Returns:
+        sliding_window_length: sliding window的长度
+    """
+    if input_ids is None:
+        raise ValueError("You must specify input_ids to get window length")
+
+    if len(input_ids) == 0:
+        return 0
+    
+    # 定义标签的token ids
+    SUMMARY_START_ID = 151669  # <summary>
+    SUMMARY_END_ID = 151670    # </summary>
+    
+    # 检查是否存在 </summary> 标签
+    end_summary_positions = (input_ids == SUMMARY_END_ID).nonzero(as_tuple=True)[0]
+    
+    if len(end_summary_positions) == 0:
+        # 不存在 </summary> 标签，返回整个input_ids的长度
+        return len(input_ids)
+    
+    # 存在 </summary> 标签，找到最后一个 <summary> 标签的位置
+    start_summary_positions = (input_ids == SUMMARY_START_ID).nonzero(as_tuple=True)[0]
+    
+    if len(start_summary_positions) == 0:
+        # 存在 </summary> 但不存在 <summary>，这种情况下返回整个长度
+        return len(input_ids)
+    
+    # 找到最后一个 <summary> 标签的位置
+    last_summary_start = start_summary_positions[-1].item()
+    
+    # 计算从最后一个 <summary> 开始到末尾的长度
+    sliding_window_length = len(input_ids) - last_summary_start
+    
+    return sliding_window_length
 
 @auto_docstring
 class Qwen3Model(Qwen3PreTrainedModel):
@@ -359,6 +410,11 @@ class Qwen3Model(Qwen3PreTrainedModel):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
+        
+        sliding_window = calculate_sliding_window(input_ids=input_ids)
+        # update sliding window for casual mask
+        self.config.sliding_window = sliding_window
+
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -394,13 +450,14 @@ class Qwen3Model(Qwen3PreTrainedModel):
             }
             # The sliding window alternating layers are not always activated depending on the config
             if self.has_sliding_layers:
-                # lets test if we can change this file
                 causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
 
         hidden_states = inputs_embeds
 
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+        kwargs['sliding_window'] = sliding_window
 
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
             hidden_states = decoder_layer(
