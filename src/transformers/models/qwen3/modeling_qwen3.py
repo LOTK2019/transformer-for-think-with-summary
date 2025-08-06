@@ -190,7 +190,7 @@ class Qwen3Attention(nn.Module):
         attention_mask: Optional[torch.Tensor],
         past_key_value: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        **kwargs: Unpack[FlashAttentionKwargs],
+        **kwargs,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
         
         if 'sliding_window' not in kwargs and self.config.use_sliding_window:
@@ -255,7 +255,7 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
-        **kwargs: Unpack[TransformersKwargs],
+        **kwargs,
     ) -> tuple[torch.Tensor]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -332,7 +332,7 @@ class Qwen3RotaryEmbedding(nn.Module):
 
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
-def calculate_sliding_window(input_ids: torch.LongTensor) -> int:
+def calculate_sliding_window(input_ids: torch.LongTensor, use_sliding_window: bool) -> int:
     """
     计算sliding window的长度
     
@@ -351,6 +351,9 @@ def calculate_sliding_window(input_ids: torch.LongTensor) -> int:
 
     if len(input_ids) == 0:
         return 0
+    
+    if not use_sliding_window:
+        return len(input_ids)
     
     # 定义标签的token ids
     SUMMARY_START_ID = 151669  # <summary>
@@ -408,10 +411,11 @@ class Qwen3Model(Qwen3PreTrainedModel):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        **kwargs: Unpack[TransformersKwargs],
+        **kwargs,
     ) -> BaseModelOutputWithPast:
-        
-        sliding_window = calculate_sliding_window(input_ids=input_ids)
+        use_sliding_window = kwargs.get('use_sliding_window', False)
+
+        sliding_window = calculate_sliding_window(input_ids=input_ids, use_sliding_window=use_sliding_window)
         # update sliding window for casual mask
         self.config.sliding_window = sliding_window
 
