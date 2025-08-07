@@ -190,13 +190,10 @@ class Qwen3Attention(nn.Module):
         attention_mask: Optional[torch.Tensor],
         past_key_value: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        **kwargs,
+        tws_sliding_window: Optional[int] = None,
+        **kwargs: Unpack[TransformersKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
-        
-        if 'sliding_window' not in kwargs and self.config.use_sliding_window:
-            raise ValueError("sliding window miss")
-        
-        sliding_window = kwargs.get('sliding_window', None)
+        sliding_window = tws_sliding_window
 
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
@@ -255,7 +252,8 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
-        **kwargs,
+        tws_sliding_window: Optional[int] = None,
+        **kwargs: Unpack[TransformersKwargs],
     ) -> tuple[torch.Tensor]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -268,6 +266,7 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
             use_cache=use_cache,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
+            tws_sliding_window=tws_sliding_window,
             **kwargs,
         )
         hidden_states = residual + hidden_states
@@ -332,7 +331,7 @@ class Qwen3RotaryEmbedding(nn.Module):
 
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
-def calculate_sliding_window(input_ids: torch.LongTensor, use_sliding_window: bool) -> int:
+def calculate_sliding_window(input_ids: torch.LongTensor, use_tws_sliding_window: bool) -> int:
     """
     计算sliding window的长度
     
@@ -352,7 +351,7 @@ def calculate_sliding_window(input_ids: torch.LongTensor, use_sliding_window: bo
     if len(input_ids) == 0:
         return 0
     
-    if not use_sliding_window:
+    if not use_tws_sliding_window:
         return len(input_ids)
     
     # 定义标签的token ids
@@ -411,11 +410,10 @@ class Qwen3Model(Qwen3PreTrainedModel):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        **kwargs,
+        use_tws_sliding_window: Optional[bool] = False,
+        **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
-        use_sliding_window = kwargs.get('use_sliding_window', False)
-
-        sliding_window = calculate_sliding_window(input_ids=input_ids, use_sliding_window=use_sliding_window)
+        sliding_window = calculate_sliding_window(input_ids=input_ids, use_tws_sliding_window=use_tws_sliding_window)
         # update sliding window for casual mask
         self.config.sliding_window = sliding_window
 
@@ -461,8 +459,6 @@ class Qwen3Model(Qwen3PreTrainedModel):
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-        kwargs['sliding_window'] = sliding_window
-
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
             hidden_states = decoder_layer(
                 hidden_states,
@@ -472,6 +468,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 use_cache=use_cache,
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
+                tws_sliding_window=sliding_window if use_tws_sliding_window else None,
                 **kwargs,
             )
 
@@ -516,6 +513,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         use_cache: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
+        use_tws_sliding_window: Optional[bool] = False,
         **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
         r"""
@@ -548,6 +546,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             cache_position=cache_position,
+            use_tws_sliding_window=use_tws_sliding_window,
             **kwargs,
         )
 
