@@ -331,54 +331,47 @@ class Qwen3RotaryEmbedding(nn.Module):
 
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
+# 需要保证 input_ids 是 LongTensor，在 GPU 上操作提升效率
 def calculate_sliding_window(input_ids: torch.LongTensor, use_tws_sliding_window: bool) -> int:
-    """
-    计算sliding window的长度
-    
-    规则：
-    - 如果存在 </summary> 标签（id=151670），则从最后一个 <summary> 标签（id=151669）开始到末尾
-    - 如果不存在 </summary> 标签，则为整个input_ids的长度
-    
-    Args:
-        input_ids: 输入的token ids张量
-    
-    Returns:
-        sliding_window_length: sliding window的长度
-    """
-    if input_ids is None:
-        raise ValueError("You must specify input_ids to get window length")
-
-    if len(input_ids) == 0:
-        return 0
-    
     if not use_tws_sliding_window:
-        return len(input_ids)
-    
-    # 定义标签的token ids
-    SUMMARY_START_ID = 151669  # <summary>
-    SUMMARY_END_ID = 151670    # </summary>
-    
-    # 检查是否存在 </summary> 标签
-    end_summary_positions = (input_ids == SUMMARY_END_ID).nonzero(as_tuple=True)[0]
-    
-    if len(end_summary_positions) == 0:
-        # 不存在 </summary> 标签，返回整个input_ids的长度
-        return len(input_ids)
-    
-    # 存在 </summary> 标签，找到最后一个 <summary> 标签的位置
-    start_summary_positions = (input_ids == SUMMARY_START_ID).nonzero(as_tuple=True)[0]
-    
-    if len(start_summary_positions) == 0:
-        # 存在 </summary> 但不存在 <summary>，这种情况下返回整个长度
-        return len(input_ids)
-    
-    # 找到最后一个 <summary> 标签的位置
-    last_summary_start = start_summary_positions[-1].item()
-    
-    # 计算从最后一个 <summary> 开始到末尾的长度
-    sliding_window_length = len(input_ids) - last_summary_start
-    
-    return sliding_window_length
+        return input_ids.shape[-1]
+    if input_ids.numel() == 0:
+        return 0
+
+    seq = input_ids if input_ids.dim() == 1 else input_ids[0]  # 假设 batch=1 或取第一条
+    L = seq.shape[0]
+
+    # 定义前缀
+    start_prefix = torch.tensor([27, 1708], device=seq.device, dtype=seq.dtype)   # '<summary'
+    end_prefix   = torch.tensor([522, 1708], device=seq.device, dtype=seq.dtype)  # '</summary'
+
+    if L < 2:
+        return L
+
+    # 创建 sliding view: (L-1, 2)
+    # 方法：利用 stride tricks 或 unsqueeze + slicing
+    # 简洁写法（兼容性好）：
+    windows = torch.stack([seq[:-1], seq[1:]], dim=1)  # shape: (L-1, 2)
+
+    # 找匹配位置
+    start_match = (windows == start_prefix).all(dim=1)  # (L-1,)
+    end_match   = (windows == end_prefix).all(dim=1)
+
+    start_positions = torch.where(start_match)[0].tolist()
+    end_positions   = torch.where(end_match)[0].tolist()
+
+    if not end_positions:
+        return L
+    if not start_positions:
+        return L
+
+    last_end = end_positions[-1]
+    valid_starts = [s for s in start_positions if s < last_end]
+    if not valid_starts:
+        return L
+
+    last_summary_start = valid_starts[-1]
+    return L - last_summary_start
 
 @auto_docstring
 class Qwen3Model(Qwen3PreTrainedModel):
@@ -513,7 +506,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         use_cache: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        use_tws_sliding_window: Optional[bool] = False,
+        use_tws_sliding_window: Optional[bool] = True,
         **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
         r"""
