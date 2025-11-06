@@ -330,48 +330,44 @@ class Qwen3RotaryEmbedding(nn.Module):
             sin = emb.sin() * self.attention_scaling
 
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+    
+class TWSState:
+    def __init__(self):
+        self.reset()
 
-# 需要保证 input_ids 是 LongTensor，在 GPU 上操作提升效率
-def calculate_sliding_window(input_ids: torch.LongTensor, use_tws_sliding_window: bool) -> int:
-    if not use_tws_sliding_window:
-        return input_ids.shape[-1]
-    if input_ids.numel() == 0:
-        return 0
+    def reset(self, len=0):
+        self.buffer = []                 # 最近 token，用于匹配前缀
+        self.total_length = len            # 已处理 token 总数（绝对位置）
+        self.last_summary_start = None   # 最近一次 <summary 的起始绝对位置
+        self.sliding_window_start = 0    # 当前 sliding window 起始位置（绝对）
 
-    seq = input_ids if input_ids.dim() == 1 else input_ids[0]  # 假设 batch=1 或取第一条
-    L = seq.shape[0]
+    def update(self, new_token_id: int) -> Optional[int]:
+        """
+        输入一个新 token，更新状态。
+        返回：当前应使用的 sliding window 长度（从 window 起点到当前末尾），
+              如果未触发 summary，则返回 None（表示用 full window）
+        """
+        self.total_length += 1
+        self.buffer.append(new_token_id)
+        if len(self.buffer) > 2:
+            self.buffer.pop(0)
 
-    # 定义前缀
-    start_prefix = torch.tensor([27, 1708], device=seq.device, dtype=seq.dtype)   # '<summary'
-    end_prefix   = torch.tensor([522, 1708], device=seq.device, dtype=seq.dtype)  # '</summary'
-
-    if L < 2:
-        return L
-
-    # 创建 sliding view: (L-1, 2)
-    # 方法：利用 stride tricks 或 unsqueeze + slicing
-    # 简洁写法（兼容性好）：
-    windows = torch.stack([seq[:-1], seq[1:]], dim=1)  # shape: (L-1, 2)
-
-    # 找匹配位置
-    start_match = (windows == start_prefix).all(dim=1)  # (L-1,)
-    end_match   = (windows == end_prefix).all(dim=1)
-
-    start_positions = torch.where(start_match)[0].tolist()
-    end_positions   = torch.where(end_match)[0].tolist()
-
-    if not end_positions:
-        return L
-    if not start_positions:
-        return L
-
-    last_end = end_positions[-1]
-    valid_starts = [s for s in start_positions if s < last_end]
-    if not valid_starts:
-        return L
-
-    last_summary_start = valid_starts[-1]
-    return L - last_summary_start
+        # 检查是否匹配 <summary 前缀
+        if len(self.buffer) == 2:
+            if self.buffer == [27, 1708]:  # '<summary'
+                self.last_summary_start = self.total_length - 2  # 起始位置是前一个 token
+            elif self.buffer == [522, 1708]:  # '</summary'
+                if self.last_summary_start is not None:
+                    # 成功匹配一对，激活 sliding window
+                    self.sliding_window_start = self.last_summary_start
+                    # TWS 通常只关心最后一个，所以保留即可
+    
+    def get_length(self):
+        return self.total_length
+    
+    def get_sliding_length(self):
+        # 如果已有有效的 sliding window 起点，返回 window 长度
+        return self.total_length - self.sliding_window_start
 
 @auto_docstring
 class Qwen3Model(Qwen3PreTrainedModel):
@@ -389,8 +385,23 @@ class Qwen3Model(Qwen3PreTrainedModel):
         self.gradient_checkpointing = False
         self.has_sliding_layers = "sliding_attention" in self.config.layer_types
 
+        self.tws_state = TWSState()
+
         # Initialize weights and apply final processing
         self.post_init()
+
+    # 需要保证 input_ids 是 LongTensor，在 GPU 上操作提升效率
+    def calculate_sliding_window(self, input_ids: torch.LongTensor, use_tws_sliding_window: bool) -> int:
+        seq = input_ids if input_ids.dim() == 1 else input_ids[0]  # 假设 batch=1 或取第一条
+        L = seq.shape[0]
+        # 长度大于 1，认为是新的任务，那么重置状态
+        if L > 1:
+            self.tws_state.reset(L - 1)
+        # 更新最后一个 token
+        self.tws_state.update(seq[-1])
+        if not use_tws_sliding_window:
+            return self.tws_state.get_length()
+        return self.tws_state.get_sliding_length()
 
     @check_model_inputs
     @auto_docstring
@@ -406,7 +417,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
         use_tws_sliding_window: Optional[bool] = False,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
-        sliding_window = calculate_sliding_window(input_ids=input_ids, use_tws_sliding_window=use_tws_sliding_window)
+        sliding_window = self.calculate_sliding_window(input_ids=input_ids, use_tws_sliding_window=use_tws_sliding_window)
         # update sliding window for casual mask
         self.config.sliding_window = sliding_window
 
